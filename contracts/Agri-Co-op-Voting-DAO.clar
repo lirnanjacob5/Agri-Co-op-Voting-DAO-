@@ -11,6 +11,7 @@
 (define-constant ERR-EXECUTION-FAILED (err u107))
 (define-constant ERR-SELF-DELEGATION (err u108))
 (define-constant ERR-CIRCULAR-DELEGATION (err u109))
+(define-constant ERR-PROPOSAL-CANCELLED (err u110))
 
 ;; Governance token
 (define-fungible-token governance-token)
@@ -32,6 +33,7 @@
         start-block: uint,
         end-block: uint,
         executed: bool,
+        cancelled: bool,
         yes-votes: uint,
         no-votes: uint,
         proposal-type: (string-ascii 20),
@@ -139,6 +141,7 @@
                 start-block: start-block,
                 end-block: end-block,
                 executed: false,
+                cancelled: false,
                 yes-votes: u0,
                 no-votes: u0,
                 proposal-type: "general",
@@ -170,6 +173,7 @@
                 start-block: start-block,
                 end-block: end-block,
                 executed: false,
+                cancelled: false,
                 yes-votes: u0,
                 no-votes: u0,
                 proposal-type: "treasury",
@@ -200,6 +204,7 @@
                 start-block: start-block,
                 end-block: end-block,
                 executed: false,
+                cancelled: false,
                 yes-votes: u0,
                 no-votes: u0,
                 proposal-type: "parameter",
@@ -208,6 +213,22 @@
         )
         (var-set proposal-count (+ proposal-id u1))
         (ok proposal-id)
+    )
+)
+
+;; Proposal cancellation
+(define-public (cancel-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+        )
+        (asserts! (is-eq tx-sender (get proposer proposal)) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get executed proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
+        (asserts! (< stacks-block-height (get end-block proposal)) ERR-PROPOSAL-EXPIRED)
+        
+        (map-set proposals proposal-id (merge proposal {cancelled: true}))
+        (ok true)
     )
 )
 
@@ -220,6 +241,7 @@
         )
         (asserts! (not (default-to false (map-get? votes {proposal-id: proposal-id, voter: tx-sender}))) ERR-ALREADY-VOTED)
         (asserts! (< stacks-block-height (get end-block proposal)) ERR-PROPOSAL-EXPIRED)
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
         (asserts! (> effective-balance u0) ERR-INSUFFICIENT-TOKENS)
         
         (map-set votes {proposal-id: proposal-id, voter: tx-sender} vote-bool)
@@ -245,6 +267,7 @@
         )
         (asserts! (>= stacks-block-height (get end-block proposal)) ERR-PROPOSAL-EXPIRED)
         (asserts! (not (get executed proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
         (asserts! proposal-passed ERR-PROPOSAL-NOT-PASSED)
         
         (if (is-eq (get proposal-type proposal) "treasury")
@@ -257,7 +280,7 @@
     )
 )
 
-(define-private (execute-treasury-proposal (proposal-id uint) (proposal {title: (string-ascii 50), description: (string-ascii 500), proposer: principal, start-block: uint, end-block: uint, executed: bool, yes-votes: uint, no-votes: uint, proposal-type: (string-ascii 20), execution-data: (optional {recipient: (optional principal), amount: (optional uint), new-value: (optional uint)})}))
+(define-private (execute-treasury-proposal (proposal-id uint) (proposal {title: (string-ascii 50), description: (string-ascii 500), proposer: principal, start-block: uint, end-block: uint, executed: bool, cancelled: bool, yes-votes: uint, no-votes: uint, proposal-type: (string-ascii 20), execution-data: (optional {recipient: (optional principal), amount: (optional uint), new-value: (optional uint)})}))
     (let
         (
             (exec-data (unwrap! (get execution-data proposal) ERR-EXECUTION-FAILED))
@@ -271,7 +294,7 @@
     )
 )
 
-(define-private (execute-parameter-proposal (proposal-id uint) (proposal {title: (string-ascii 50), description: (string-ascii 500), proposer: principal, start-block: uint, end-block: uint, executed: bool, yes-votes: uint, no-votes: uint, proposal-type: (string-ascii 20), execution-data: (optional {recipient: (optional principal), amount: (optional uint), new-value: (optional uint)})}))
+(define-private (execute-parameter-proposal (proposal-id uint) (proposal {title: (string-ascii 50), description: (string-ascii 500), proposer: principal, start-block: uint, end-block: uint, executed: bool, cancelled: bool, yes-votes: uint, no-votes: uint, proposal-type: (string-ascii 20), execution-data: (optional {recipient: (optional principal), amount: (optional uint), new-value: (optional uint)})}))
     (let
         (
             (exec-data (unwrap! (get execution-data proposal) ERR-EXECUTION-FAILED))
@@ -283,7 +306,7 @@
     )
 )
 
-(define-private (execute-general-proposal (proposal-id uint) (proposal {title: (string-ascii 50), description: (string-ascii 500), proposer: principal, start-block: uint, end-block: uint, executed: bool, yes-votes: uint, no-votes: uint, proposal-type: (string-ascii 20), execution-data: (optional {recipient: (optional principal), amount: (optional uint), new-value: (optional uint)})}))
+(define-private (execute-general-proposal (proposal-id uint) (proposal {title: (string-ascii 50), description: (string-ascii 500), proposer: principal, start-block: uint, end-block: uint, executed: bool, cancelled: bool, yes-votes: uint, no-votes: uint, proposal-type: (string-ascii 20), execution-data: (optional {recipient: (optional principal), amount: (optional uint), new-value: (optional uint)})}))
     (begin
         (map-set proposals proposal-id (merge proposal {executed: true}))
         (ok true)
@@ -321,6 +344,13 @@
 
 (define-read-only (get-effective-voting-power-read (voter principal))
     (get-effective-voting-power voter)
+)
+
+(define-read-only (is-proposal-cancelled (proposal-id uint))
+    (match (map-get? proposals proposal-id)
+        proposal (get cancelled proposal)
+        false
+    )
 )
 
 ;; Token transfer function
