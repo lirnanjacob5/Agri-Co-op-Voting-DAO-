@@ -56,6 +56,16 @@
     uint
 )
 
+(define-map voting-power-snapshots
+    { proposal-id: uint, voter: principal }
+    uint
+)
+
+(define-map proposal-voters
+    { proposal-id: uint, voter: principal }
+    bool
+)
+
 ;; Token initialization
 (define-public (initialize-token (total-supply uint))
     (begin
@@ -121,6 +131,26 @@
     )
 )
 
+(define-private (create-voting-snapshot (proposal-id uint) (voter principal))
+    (let
+        (
+            (voting-power (get-effective-voting-power voter))
+        )
+        (if (> voting-power u0)
+            (begin
+                (map-set voting-power-snapshots {proposal-id: proposal-id, voter: voter} voting-power)
+                (map-set proposal-voters {proposal-id: proposal-id, voter: voter} true)
+                voting-power
+            )
+            u0
+        )
+    )
+)
+
+(define-private (get-snapshot-voting-power (proposal-id uint) (voter principal))
+    (default-to u0 (map-get? voting-power-snapshots {proposal-id: proposal-id, voter: voter}))
+)
+
 ;; Proposal creation functions
 (define-public (create-proposal (title (string-ascii 50)) (description (string-ascii 500)) (duration uint))
     (let
@@ -148,6 +178,7 @@
                 execution-data: none
             }
         )
+        (create-voting-snapshot proposal-id tx-sender)
         (var-set proposal-count (+ proposal-id u1))
         (ok proposal-id)
     )
@@ -180,6 +211,7 @@
                 execution-data: (some {recipient: (some recipient), amount: (some amount), new-value: none})
             }
         )
+        (create-voting-snapshot proposal-id tx-sender)
         (var-set proposal-count (+ proposal-id u1))
         (ok proposal-id)
     )
@@ -211,6 +243,7 @@
                 execution-data: (some {recipient: none, amount: none, new-value: (some new-quorum)})
             }
         )
+        (create-voting-snapshot proposal-id tx-sender)
         (var-set proposal-count (+ proposal-id u1))
         (ok proposal-id)
     )
@@ -237,19 +270,19 @@
     (let
         (
             (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
-            (effective-balance (get-effective-voting-power tx-sender))
+            (snapshot-power (get-snapshot-voting-power proposal-id tx-sender))
         )
         (asserts! (not (default-to false (map-get? votes {proposal-id: proposal-id, voter: tx-sender}))) ERR-ALREADY-VOTED)
         (asserts! (< stacks-block-height (get end-block proposal)) ERR-PROPOSAL-EXPIRED)
         (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
-        (asserts! (> effective-balance u0) ERR-INSUFFICIENT-TOKENS)
+        (asserts! (> snapshot-power u0) ERR-INSUFFICIENT-TOKENS)
         
         (map-set votes {proposal-id: proposal-id, voter: tx-sender} vote-bool)
         (map-set proposals proposal-id
             (merge proposal 
                 {
-                    yes-votes: (if vote-bool (+ (get yes-votes proposal) effective-balance) (get yes-votes proposal)),
-                    no-votes: (if vote-bool (get no-votes proposal) (+ (get no-votes proposal) effective-balance))
+                    yes-votes: (if vote-bool (+ (get yes-votes proposal) snapshot-power) (get yes-votes proposal)),
+                    no-votes: (if vote-bool (get no-votes proposal) (+ (get no-votes proposal) snapshot-power))
                 }
             )
         )
@@ -351,6 +384,14 @@
         proposal (get cancelled proposal)
         false
     )
+)
+
+(define-read-only (get-voting-power-snapshot (proposal-id uint) (voter principal))
+    (get-snapshot-voting-power proposal-id voter)
+)
+
+(define-read-only (has-voter-snapshot (proposal-id uint) (voter principal))
+    (is-some (map-get? voting-power-snapshots {proposal-id: proposal-id, voter: voter}))
 )
 
 ;; Token transfer function
