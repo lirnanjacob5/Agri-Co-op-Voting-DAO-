@@ -12,6 +12,9 @@
 (define-constant ERR-SELF-DELEGATION (err u108))
 (define-constant ERR-CIRCULAR-DELEGATION (err u109))
 (define-constant ERR-PROPOSAL-CANCELLED (err u110))
+(define-constant ERR-INVALID-REPUTATION-ACTION (err u111))
+(define-constant ERR-REPUTATION-OVERFLOW (err u112))
+(define-constant ERR-INSUFFICIENT-REPUTATION (err u113))
 
 ;; Governance token
 (define-fungible-token governance-token)
@@ -22,6 +25,15 @@
 (define-data-var treasury-balance uint u0)
 (define-data-var quorum-threshold uint u1000)
 (define-data-var contract-owner principal tx-sender)
+
+;; Reputation System Constants
+(define-constant REPUTATION-CREATE-PROPOSAL u50)
+(define-constant REPUTATION-VOTE-CAST u10)
+(define-constant REPUTATION-PROPOSAL-EXECUTED u100)
+(define-constant REPUTATION-DELEGATION u5)
+(define-constant REPUTATION-STREAK-BONUS u25)
+(define-constant REPUTATION-MAX-SCORE u10000)
+(define-constant STREAK-RESET-BLOCKS u4320) ;; ~30 days
 
 ;; Data maps
 (define-map proposals 
@@ -64,6 +76,27 @@
 (define-map proposal-voters
     { proposal-id: uint, voter: principal }
     bool
+)
+
+;; Reputation System Maps
+(define-map member-reputation
+    principal
+    {
+        score: uint,
+        proposals-created: uint,
+        votes-cast: uint,
+        participation-streak: uint,
+        last-activity-block: uint,
+        governance-contribution: uint
+    }
+)
+
+(define-map reputation-actions
+    { member: principal, action-type: (string-ascii 20), block-height: uint }
+    {
+        points-earned: uint,
+        description: (string-ascii 100)
+    }
 )
 
 ;; Token initialization
@@ -151,6 +184,77 @@
     (default-to u0 (map-get? voting-power-snapshots {proposal-id: proposal-id, voter: voter}))
 )
 
+;; Reputation System Functions
+(define-private (initialize-member-reputation (member principal))
+    (if (is-none (map-get? member-reputation member))
+        (map-set member-reputation member
+            {
+                score: u0,
+                proposals-created: u0,
+                votes-cast: u0,
+                participation-streak: u0,
+                last-activity-block: u0,
+                governance-contribution: u0
+            }
+        )
+        true
+    )
+)
+
+(define-private (update-reputation (member principal) (points uint) (action-type (string-ascii 20)))
+    (let
+        (
+            (current-rep (default-to {score: u0, proposals-created: u0, votes-cast: u0, participation-streak: u0, last-activity-block: u0, governance-contribution: u0} (map-get? member-reputation member)))
+            (new-score (+ (get score current-rep) points))
+            (capped-score (if (> new-score REPUTATION-MAX-SCORE) REPUTATION-MAX-SCORE new-score))
+            (streak-bonus (calculate-streak-bonus member))
+        )
+        (asserts! (<= new-score REPUTATION-MAX-SCORE) ERR-REPUTATION-OVERFLOW)
+        
+        ;; Update reputation record
+        (map-set member-reputation member
+            (merge current-rep 
+                {
+                    score: capped-score,
+                    last-activity-block: stacks-block-height,
+                    governance-contribution: (+ (get governance-contribution current-rep) points)
+                }
+            )
+        )
+        
+        ;; Record the action
+        (map-set reputation-actions 
+            { member: member, action-type: action-type, block-height: stacks-block-height }
+            { points-earned: points, description: action-type }
+        )
+        
+        (ok capped-score)
+    )
+)
+
+(define-private (calculate-streak-bonus (member principal))
+    (let
+        (
+            (rep-data (default-to {score: u0, proposals-created: u0, votes-cast: u0, participation-streak: u0, last-activity-block: u0, governance-contribution: u0} (map-get? member-reputation member)))
+            (last-activity (get last-activity-block rep-data))
+            (blocks-since-activity (- stacks-block-height last-activity))
+        )
+        (if (and (> last-activity u0) (<= blocks-since-activity STREAK-RESET-BLOCKS))
+            (+ (get participation-streak rep-data) u1)
+            u0
+        )
+    )
+)
+
+(define-public (award-reputation (member principal) (points uint) (action (string-ascii 20)))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> points u0) ERR-INVALID-REPUTATION-ACTION)
+        (initialize-member-reputation member)
+        (update-reputation member points action)
+    )
+)
+
 ;; Proposal creation functions
 (define-public (create-proposal (title (string-ascii 50)) (description (string-ascii 500)) (duration uint))
     (let
@@ -180,6 +284,24 @@
         )
         (create-voting-snapshot proposal-id tx-sender)
         (var-set proposal-count (+ proposal-id u1))
+        
+        ;; Award reputation for creating proposal
+        (initialize-member-reputation tx-sender)
+        (let
+            (
+                (current-rep (default-to {score: u0, proposals-created: u0, votes-cast: u0, participation-streak: u0, last-activity-block: u0, governance-contribution: u0} (map-get? member-reputation tx-sender)))
+            )
+            (map-set member-reputation tx-sender
+                (merge current-rep 
+                    {
+                        proposals-created: (+ (get proposals-created current-rep) u1),
+                        participation-streak: (+ (calculate-streak-bonus tx-sender) u1)
+                    }
+                )
+            )
+            (unwrap-panic (update-reputation tx-sender REPUTATION-CREATE-PROPOSAL "proposal-created"))
+        )
+        
         (ok proposal-id)
     )
 )
@@ -286,6 +408,24 @@
                 }
             )
         )
+        
+        ;; Award reputation for voting
+        (initialize-member-reputation tx-sender)
+        (let
+            (
+                (current-rep (default-to {score: u0, proposals-created: u0, votes-cast: u0, participation-streak: u0, last-activity-block: u0, governance-contribution: u0} (map-get? member-reputation tx-sender)))
+            )
+            (map-set member-reputation tx-sender
+                (merge current-rep 
+                    {
+                        votes-cast: (+ (get votes-cast current-rep) u1),
+                        participation-streak: (+ (calculate-streak-bonus tx-sender) u1)
+                    }
+                )
+            )
+            (unwrap-panic (update-reputation tx-sender REPUTATION-VOTE-CAST "vote-cast"))
+        )
+        
         (ok true)
     )
 )
@@ -392,6 +532,72 @@
 
 (define-read-only (has-voter-snapshot (proposal-id uint) (voter principal))
     (is-some (map-get? voting-power-snapshots {proposal-id: proposal-id, voter: voter}))
+)
+
+;; Reputation System Read-Only Functions
+(define-read-only (get-member-reputation (member principal))
+    (map-get? member-reputation member)
+)
+
+(define-read-only (get-reputation-score (member principal))
+    (match (map-get? member-reputation member)
+        rep-data (get score rep-data)
+        u0
+    )
+)
+
+(define-read-only (get-member-participation-stats (member principal))
+    (match (map-get? member-reputation member)
+        rep-data {
+            proposals-created: (get proposals-created rep-data),
+            votes-cast: (get votes-cast rep-data),
+            participation-streak: (get participation-streak rep-data),
+            governance-contribution: (get governance-contribution rep-data)
+        }
+        {
+            proposals-created: u0,
+            votes-cast: u0,
+            participation-streak: u0,
+            governance-contribution: u0
+        }
+    )
+)
+
+(define-read-only (get-reputation-action (member principal) (action-type (string-ascii 20)) (target-block uint))
+    (map-get? reputation-actions { member: member, action-type: action-type, block-height: target-block })
+)
+
+(define-read-only (is-active-member (member principal))
+    (match (map-get? member-reputation member)
+        rep-data (let
+            (
+                (blocks-since-activity (- stacks-block-height (get last-activity-block rep-data)))
+            )
+            (<= blocks-since-activity STREAK-RESET-BLOCKS)
+        )
+        false
+    )
+)
+
+(define-read-only (get-reputation-tier (member principal))
+    (let
+        (
+            (score (get-reputation-score member))
+        )
+        (if (>= score u5000)
+            "Expert"
+            (if (>= score u2000)
+                "Advanced"
+                (if (>= score u500)
+                    "Intermediate"
+                    (if (>= score u100)
+                        "Beginner"
+                        "Newcomer"
+                    )
+                )
+            )
+        )
+    )
 )
 
 ;; Token transfer function
