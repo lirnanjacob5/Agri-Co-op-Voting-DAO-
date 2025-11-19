@@ -34,6 +34,11 @@
 (define-constant REPUTATION-STREAK-BONUS u25)
 (define-constant REPUTATION-MAX-SCORE u10000)
 (define-constant STREAK-RESET-BLOCKS u4320) ;; ~30 days
+(define-constant VETO-COOLDOWN-BLOCKS u144)
+(define-constant VETO-REPUTATION-THRESHOLD u5000)
+(define-constant ERR-INSUFFICIENT-VETO-REPUTATION (err u114))
+(define-constant ERR-VETO-COOLDOWN-ACTIVE (err u115))
+(define-constant ERR-PROPOSAL-ALREADY-VETOED (err u116))
 
 ;; Data maps
 (define-map proposals 
@@ -76,6 +81,16 @@
 (define-map proposal-voters
     { proposal-id: uint, voter: principal }
     bool
+)
+
+(define-map proposal-veto
+    uint
+    { vetoed: bool, by: principal, block: uint }
+)
+
+(define-map member-last-veto
+    principal
+    uint
 )
 
 ;; Reputation System Maps
@@ -387,6 +402,26 @@
     )
 )
 
+(define-public (veto-proposal (proposal-id uint))
+    (let
+        (
+            (proposal (unwrap! (map-get? proposals proposal-id) ERR-INVALID-PROPOSAL))
+            (score (get-reputation-score tx-sender))
+            (last-veto (default-to u0 (map-get? member-last-veto tx-sender)))
+            (blocks-since (- stacks-block-height last-veto))
+        )
+        (asserts! (>= score VETO-REPUTATION-THRESHOLD) ERR-INSUFFICIENT-VETO-REPUTATION)
+        (asserts! (>= blocks-since VETO-COOLDOWN-BLOCKS) ERR-VETO-COOLDOWN-ACTIVE)
+        (asserts! (is-none (map-get? proposal-veto proposal-id)) ERR-PROPOSAL-ALREADY-VETOED)
+        (asserts! (not (get executed proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
+        (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
+        (map-set proposals proposal-id (merge proposal {cancelled: true}))
+        (map-set proposal-veto proposal-id { vetoed: true, by: tx-sender, block: stacks-block-height })
+        (map-set member-last-veto tx-sender stacks-block-height)
+        (ok true)
+    )
+)
+
 ;; Voting function
 (define-public (vote (proposal-id uint) (vote-bool bool))
     (let
@@ -441,6 +476,7 @@
         (asserts! (>= stacks-block-height (get end-block proposal)) ERR-PROPOSAL-EXPIRED)
         (asserts! (not (get executed proposal)) ERR-PROPOSAL-ALREADY-EXECUTED)
         (asserts! (not (get cancelled proposal)) ERR-PROPOSAL-CANCELLED)
+        (asserts! (not (is-proposal-vetoed proposal-id)) ERR-PROPOSAL-CANCELLED)
         (asserts! proposal-passed ERR-PROPOSAL-NOT-PASSED)
         
         (if (is-eq (get proposal-type proposal) "treasury")
@@ -598,6 +634,17 @@
             )
         )
     )
+)
+
+(define-read-only (is-proposal-vetoed (proposal-id uint))
+    (match (map-get? proposal-veto proposal-id)
+        v (get vetoed v)
+        false
+    )
+)
+
+(define-read-only (get-member-last-veto (member principal))
+    (default-to u0 (map-get? member-last-veto member))
 )
 
 ;; Token transfer function
